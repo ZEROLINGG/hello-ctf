@@ -1,50 +1,97 @@
-"""
-WordlistLoader  – 大文件词表加载器，支持 O(1) 随机行访问、断点续传、二进制索引缓存。
-PayloadLoader   – 多字段组合包装器，支持 PARALLEL / PRODUCT 策略。
-
-"""
-
 from __future__ import annotations
 
 import array
 import hashlib
 import json
+import mmap
+import os
 import struct
-from enum import Enum, auto
 from pathlib import Path
-from typing import IO, Iterator, Optional
+from typing import Iterator, Optional, BinaryIO
 
 import xxhash
+
+from ctf import debug_log
 
 _DEFAULT_CACHE_DIR = Path.home() / ".cache" / "wordlist"
 
 
-# ---------------------------------------------------------------------------
-# WordlistLoader
-# ---------------------------------------------------------------------------
+def _build_line_index(file: BinaryIO, index_file: BinaryIO) -> mmap.mmap:
+    """构建文件的行首字节偏移量索引"""
+    file.seek(0)
+    index_file.seek(0)
+    index_file.truncate(0)
+
+    offset = 0
+    buffer = array.array("Q")  # 无符号64位整型
+    BUFFER_SIZE = 100_000
+
+    for line in file:
+        buffer.append(offset)
+        offset += len(line)
+
+        if len(buffer) >= BUFFER_SIZE:
+            index_file.write(buffer.tobytes())
+            del buffer[:]
+
+    # 写入最后一行之后的 EOF 偏移量
+    buffer.append(offset)
+    index_file.write(buffer.tobytes())
+    index_file.flush()
+
+    return mmap.mmap(index_file.fileno(), 0, access=mmap.ACCESS_READ)
+
+
+def _large_file_fast_hash(
+    path: Path, sample_size: int = 1024 * 1024, sample_interval: int = 20
+) -> str:
+    """使用稀疏采样和 xxhash 极速计算超大文件的哈希"""
+    hasher = xxhash.xxh3_64()
+    try:
+        stat = path.stat()
+        hasher.update(stat.st_size.to_bytes(8, "little"))
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(sample_size)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                if sample_interval > 0:
+                    try:
+                        f.seek(sample_size * sample_interval, os.SEEK_CUR)
+                    except OSError:
+                        break
+    except OSError as e:
+        debug_log(f"大文件哈希计算异常 {path}: {e}")
+    return hasher.hexdigest()
+
+
+def _fast_hash(data: list[str | bytes | Path]) -> str:
+    """计算元数据或小文件的组合哈希"""
+    hasher = xxhash.xxh3_64()
+    for item in data:
+        if isinstance(item, str):
+            hasher.update(item.encode("utf-8", errors="ignore"))
+        elif isinstance(item, bytes):
+            hasher.update(item)
+        elif isinstance(item, Path) and item.is_file():
+            try:
+                with item.open("rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        hasher.update(chunk)
+            except OSError as e:
+                debug_log(f"哈希计算跳过文件 {item}: {e}")
+                continue
+    return hasher.hexdigest()
+
+
+# ==========================================
+# WordlistLoader 核心类
+# ==========================================
 
 
 class WordlistLoader:
-    """
-    大文件词表加载器。
-
-    特性
-    ----
-    - O(1) 随机行访问（字节偏移索引）
-    - 断点续传（持久化 checkpoint）
-    - 高效二进制索引缓存，校验 mtime / size / content_hash / encoding / strip
-    - 文件耗尽时自动持久化最终 checkpoint
-
-    注意：非线程安全，多线程场景请在外部加锁。
-    """
-
-    _CACHE_VERSION = 5          # 版本号随缓存格式变化递增
-    _MAGIC = b"WLIDX\x00\x00\x05"
-    _SAMPLE_SIZE = 65_536       # 采样哈希的单段大小（64 KiB）
-
-    # ------------------------------------------------------------------
-    # 构造 / 析构
-    # ------------------------------------------------------------------
+    version: int = 2
 
     def __init__(
         self,
@@ -55,337 +102,311 @@ class WordlistLoader:
         continue_: bool = False,
         cache_dir: Path | None = None,
         checkpoint_interval: int = 1000,
-        use_empty_password: bool = False,
+        insert: list[str] | None = None,
         rollback: int = 1,
     ) -> None:
-        self._use_empty_password = use_empty_password
-        self._use_empty_password_done = False
         self.path = Path(path).resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"字典文件不存在: {self.path}")
+
         self.encoding = encoding
         self.errors = "ignore"
         self.strip = strip
         self.continue_ = continue_
         self.checkpoint_interval = checkpoint_interval
-
-        cache_dir = Path(cache_dir) if cache_dir else _DEFAULT_CACHE_DIR
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_key = tag if tag else hashlib.md5(str(self.path).encode()).hexdigest()[:12]
-        self._index_path = cache_dir / f"{cache_key}.index.bin"
-        self._checkpoint_path = cache_dir / f"{cache_key}.checkpoint.json"
-
-        self._offsets: array.array = array.array("Q")
-        self._line_index: int = 0
-        self._dirty: int = 0
-        self._fp: IO[bytes] | None = None
-
-        self._load_or_build_cache()
-        self._fp = open(self.path, mode="rb")
+        self.insert = insert or []
         self._rollback = max(0, rollback)
 
-        if continue_:
-            cp = self._load_checkpoint()
-            if cp and self._checkpoint_valid(cp):
-                self._restore_checkpoint(cp)
+        # 内部状态
+        self._insert_idx: int = 0
+        self._file_idx: int = 0
+        self._dirty: int = 0
 
-    def close(self) -> None:
-        if self._fp is not None and not self._fp.closed:
-            self._save_checkpoint()
-            self._fp.close()
-        self._fp = None
+        self._fp: BinaryIO | None = None
+        self._index_fp: BinaryIO | None = None
+        self._mmap: mmap.mmap | None = None
 
-    def __enter__(self) -> "WordlistLoader":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def __del__(self) -> None:
-        fp = getattr(self, "_fp", None)
-        if fp is not None and not fp.closed:
-            try:
-                fp.close()
-            except Exception:
-                pass
-        self._fp = None
-
-    # ------------------------------------------------------------------
-    # 索引缓存
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def _fast_hash(cls, path: Path) -> str:
-        """
-        对文件做三段采样哈希（头 / 中 / 尾各 SAMPLE_SIZE 字节）。
-        三段区间互不重叠：只有文件足够大时才读中段和尾段。
-        """
-        h = xxhash.xxh64()
-        s = cls._SAMPLE_SIZE
-        file_size = path.stat().st_size
-
-        with open(path, "rb") as f:
-            # 头部
-            h.update(f.read(s))
-
-            # 中部：需要文件 > 2*s 才不与头部重叠
-            mid = file_size // 2
-            if mid > s:
-                f.seek(mid)
-                h.update(f.read(s))
-
-            # 尾部：需要文件 > 3*s 才不与中部重叠
-            tail = file_size - s
-            if tail > mid + s:
-                f.seek(tail)
-                h.update(f.read(s))
-
-        return h.hexdigest()
-
-    @classmethod
-    def _write_index(cls, bin_path: Path, offsets: array.array, meta: dict) -> None:
-        meta_bytes = json.dumps(meta, separators=(",", ":")).encode()
-        with open(bin_path, "wb") as f:
-            f.write(cls._MAGIC)
-            f.write(struct.pack(">I", len(meta_bytes)))
-            f.write(meta_bytes)
-            offsets.tofile(f)
-
-    @classmethod
-    def _read_index(cls, bin_path: Path) -> tuple[array.array, dict] | None:
         try:
-            with open(bin_path, "rb") as f:
-                if f.read(8) != cls._MAGIC:
-                    return None
-                (meta_len,) = struct.unpack(">I", f.read(4))
-                meta = json.loads(f.read(meta_len))
-                buf: array.array = array.array("Q")
-                buf.fromfile(f, meta["line_count"])
-            return buf, meta
-        except Exception:
-            return None
+            # 1. 初始化缓存目录
+            base_cache_dir = Path(cache_dir) if cache_dir else _DEFAULT_CACHE_DIR
+            base_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _file_meta(self) -> dict:
-        stat = self.path.stat()
-        return {
-            "version": self._CACHE_VERSION,
-            "path": str(self.path),
-            "mtime": stat.st_mtime,
-            "size": stat.st_size,
+            cache_key = (
+                hashlib.md5(tag.encode()).hexdigest()[:12]
+                if tag
+                else hashlib.md5(str(self.path).encode()).hexdigest()[:12]
+            )
+
+            self.cache_dir = base_cache_dir / cache_key
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+            self.meta_file = self.cache_dir / "meta.json"
+            self.index_file = self.cache_dir / "index.bin"
+            self.checkpoint_file = self.cache_dir / "checkpoint.idx"
+            self.insert_checkpoint_file = self.cache_dir / "insert.idx"
+            self.loader_hash_file = self.cache_dir / "loader.hash"
+
+            # 2. 校验与构建索引
+            self._init_index_and_cache(tag)
+
+            # 3. 打开文件句柄
+            self._fp = open(self.path, "rb")
+
+            # 4. 断点续传处理
+            if self.continue_:
+                self._restore_checkpoint()
+
+        except Exception as e:
+            self.close()
+            raise RuntimeError(f"WordlistLoader 初始化失败: {e}") from e
+
+    # ------------------------------------------------------------------
+    # 初始化与缓存逻辑
+    # ------------------------------------------------------------------
+
+    def _init_index_and_cache(self, tag: str | None) -> None:
+        """检查缓存是否有效，无效则重新构建 MMap 索引"""
+        current_file_hash = _large_file_fast_hash(self.path)
+        current_meta = {
+            "tag": tag,
+            "insert": self.insert,
+            "wordlist_hash": current_file_hash,
+            "version": self.version,
             "encoding": self.encoding,
             "strip": self.strip,
-            "content_hash": self._fast_hash(self.path),
         }
 
-    def _cache_valid(self, cached_meta: dict) -> bool:
-        if cached_meta.get("version") != self._CACHE_VERSION:
-            return False
-        cur = self._file_meta()
-        return (
-            cached_meta.get("mtime") == cur["mtime"]
-            and cached_meta.get("size") == cur["size"]
-            and cached_meta.get("content_hash") == cur["content_hash"]
-            and cached_meta.get("encoding") == cur["encoding"]
-            and cached_meta.get("strip") == cur["strip"]
-        )
+        meta_str = json.dumps(current_meta, sort_keys=True)
+        rebuild_needed = True
 
-    def _build_index(self) -> None:
-        """
-        构建物理行偏移索引（每行起始字节位置）。
+        if self.meta_file.exists() and self.index_file.exists():
+            try:
+                cached_meta = json.loads(self.meta_file.read_text("utf-8"))
+                if cached_meta == current_meta:
+                    rebuild_needed = False
+            except (json.JSONDecodeError, OSError) as e:
+                debug_log(f"缓存元数据读取失败，将重建索引: {e}")
 
-        - 空文件：_offsets 为空，line_count = 0。
-        - 末尾无换行：最后一行偏移已在循环中正确记录，不额外追加。
-        - 末尾有换行：循环会追加一个等于 file_size 的偏移，裁剪掉它
-          （该偏移对应的"行"是长度为 0 的幽灵行）。
-        """
-        file_size = self.path.stat().st_size
-        if file_size == 0:
-            self._offsets = array.array("Q")
+        self._index_fp = open(self.index_file, "a+b")
+
+        if rebuild_needed:
+            debug_log(f"正在为 {self.path.name} 构建极速访问索引，请稍候...")
+            with open(self.path, "rb") as f:
+                assert self._index_fp is not None
+                self._mmap = _build_line_index(f, self._index_fp)
+
+            self.meta_file.write_text(meta_str, "utf-8")
+
+            # 清理旧的断点文件
+            for file_path in (
+                self.checkpoint_file,
+                self.insert_checkpoint_file,
+                self.loader_hash_file,
+            ):
+                file_path.unlink(missing_ok=True)
+        else:
+            # 索引复用
+            assert self._index_fp is not None
+            self._mmap = mmap.mmap(self._index_fp.fileno(), 0, access=mmap.ACCESS_READ)
+
+    # ------------------------------------------------------------------
+    # 断点续传逻辑
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self) -> None:
+        try:
+            self.checkpoint_file.write_text(str(self._file_idx))
+            self.insert_checkpoint_file.write_text(str(self._insert_idx))
+
+            meta_content = self.meta_file.read_text("utf-8")
+            check_hash = _fast_hash(
+                [meta_content, self.checkpoint_file, self.insert_checkpoint_file]
+            )
+            self.loader_hash_file.write_text(check_hash)
+            self._dirty = 0
+        except OSError as e:
+            debug_log(f"磁盘可能已满或无权限): {e}")
+
+    def _restore_checkpoint(self) -> None:
+        if not (
+            self.loader_hash_file.exists()
+            and self.checkpoint_file.exists()
+            and self.insert_checkpoint_file.exists()
+        ):
             return
 
-        offsets: list[int] = [0]
-        pos = 0
-        with open(self.path, "rb") as bf:
-            while True:
-                chunk = bf.read(1 << 20)  # 1 MiB
-                if not chunk:
-                    break
-                start = 0
-                while True:
-                    idx = chunk.find(b"\n", start)
-                    if idx == -1:
-                        break
-                    next_line_start = pos + idx + 1
-                    offsets.append(next_line_start)
-                    start = idx + 1
-                pos += len(chunk)
+        try:
+            meta_content = self.meta_file.read_text("utf-8")
+            expected_hash = _fast_hash(
+                [meta_content, self.checkpoint_file, self.insert_checkpoint_file]
+            )
 
-        # 裁剪末尾的幽灵偏移（文件以 \n 结尾时产生）
-        if offsets and offsets[-1] == file_size:
-            offsets.pop()
-
-        self._offsets = array.array("Q", offsets)
-
-    def _load_or_build_cache(self) -> None:
-        result = self._read_index(self._index_path)
-        if result is not None:
-            offsets, meta = result
-            if self._cache_valid(meta):
-                self._offsets = offsets
+            if expected_hash != self.loader_hash_file.read_text().strip():
+                debug_log("断点文件哈希校验失败，可能被篡改，放弃恢复。")
+                self.reset()
                 return
-        self._build_index()
-        meta = {**self._file_meta(), "line_count": len(self._offsets)}
-        try:
-            self._write_index(self._index_path, self._offsets, meta)
-        except Exception:
-            pass
+
+            c_file_idx = int(self.checkpoint_file.read_text().strip())
+            c_insert_idx = int(self.insert_checkpoint_file.read_text().strip())
+
+            # 应用 Rollback
+            total_progress = c_insert_idx + c_file_idx
+            rolled_progress = max(0, total_progress - self._rollback)
+
+            if rolled_progress < len(self.insert):
+                self._insert_idx = rolled_progress
+                self._file_idx = 0
+            else:
+                self._insert_idx = len(self.insert)
+                self._file_idx = rolled_progress - len(self.insert)
+
+            # Seek 到物理位置
+            if self._file_idx > 0:
+                self._seek_file_to(self._file_idx)
+
+            debug_log(f"成功恢复断点，当前位置: {self.current_index}")
+
+        except Exception as e:
+            debug_log(f"读取断点数据发生异常，将重置进度: {e}")
+            self.reset()
 
     # ------------------------------------------------------------------
-    # Checkpoint
-    # ------------------------------------------------------------------
-
-    def _save_checkpoint(self) -> None:
-        """
-        持久化当前物理行号。恢复时通过 _offsets[line_index] 重算字节偏移，
-        不依赖存储的 byte_offset，避免索引与偏移不一致的问题。
-        """
-        try:
-            payload = {
-                "line_index": self._line_index,
-                "empty_password_done": self._use_empty_password_done,
-            }
-            self._checkpoint_path.write_text(json.dumps(payload, separators=(",", ":")))
-            self._dirty = 0
-        except Exception:
-            pass
-
-    def _load_checkpoint(self) -> dict | None:
-        try:
-            return json.loads(self._checkpoint_path.read_text())
-        except Exception:
-            return None
-
-    def _checkpoint_valid(self, cp: dict) -> bool:
-        try:
-            line_index = cp.get("line_index", -1)
-            return isinstance(line_index, int) and 0 <= line_index <= len(self._offsets)
-        except Exception:
-            return False
-
-    def _restore_checkpoint(self, cp: dict) -> None:
-        line_index: int = cp["line_index"]
-        empty_done: bool = cp.get("empty_password_done", False) and self._use_empty_password
-
-        if self._rollback > 0:
-            rolled = min(line_index, self._rollback)
-            line_index -= rolled
-            if rolled > 0 and line_index == 0:
-                # 只有真正回退到起点才重置空密码状态
-                empty_done = False
-
-        self._line_index = line_index
-        self._use_empty_password_done = empty_done
-
-        assert self._fp is not None
-        if line_index < len(self._offsets):
-            self._fp.seek(self._offsets[line_index])
-        else:
-            self._fp.seek(0, 2)  # 已耗尽，seek 到 EOF
-
-    # ------------------------------------------------------------------
-    # 读取接口
+    # 核心迭代器逻辑
     # ------------------------------------------------------------------
 
     def next_word(self) -> Optional[str]:
-        """
-        返回下一个非空词，文件耗尽时返回 None 并持久化最终 checkpoint。
-        """
-        if self._use_empty_password and not self._use_empty_password_done:
-            self._use_empty_password_done = True
-            return ""
+        # 1. 优先消耗 insert 列表
+        while self._insert_idx < len(self.insert):
+            word = self.insert[self._insert_idx]
+            self._insert_idx += 1
+            self._check_dirty()
+            return word
 
+        # 2. 从文件顺序读取 (readline 最快)
         if self._fp is None or self._fp.closed:
             return None
 
         while True:
             raw = self._fp.readline()
-            if raw == b"":
-                # 文件耗尽：保存最终状态后返回
-                self._save_checkpoint()
+            if not raw:
+                self.save_checkpoint()  # EOF 触发最后一次保存
                 return None
 
-            self._line_index += 1
+            self._file_idx += 1
             line = raw.decode(self.encoding, errors=self.errors)
             word = line.strip() if self.strip else line.rstrip("\r\n")
-            if not word:
-                continue  # 空行：不计入 _dirty，不触发 checkpoint
 
-            self._dirty += 1
-            if self._dirty >= self.checkpoint_interval:
-                self._save_checkpoint()
+            if not word:
+                continue  # 跳过空行
+
+            self._check_dirty()
             return word
 
-    def next(self) -> Optional[str]:
-        return self.next_word()
+    def _check_dirty(self) -> None:
+        self._dirty += 1
+        if self._dirty >= self.checkpoint_interval:
+            self.save_checkpoint()
 
-    def seek_to_line(self, n: int) -> None:
-        """
-        跳转到第 n 物理行（0-based）。
-        n == line_count 为合法值，语义为"已耗尽/EOF 位置"。
-        """
-        if not self._offsets and n != 0:
-            raise RuntimeError("Index not built yet.")
-        total = len(self._offsets)
-        if not (0 <= n <= total):
-            raise IndexError(
-                f"Line {n} out of range [0, {total}]. "
-                f"File has {total} lines (pass n={total} to seek to EOF)."
-            )
-        if self._fp is None or self._fp.closed:
-            raise RuntimeError("File is not open.")
-        if n < total:
-            self._fp.seek(self._offsets[n])
+    # ------------------------------------------------------------------
+    # 随机访问与控制逻辑
+    # ------------------------------------------------------------------
+
+    def _seek_file_to(self, line_index: int) -> None:
+        """纯内部方法：利用 mmap 查表，将文件指针 O(1) 定位到指定行"""
+        if self._mmap is None or self._fp is None:
+            return
+
+        total_file_lines = self.file_line_count
+        target_idx = min(line_index, total_file_lines)
+
+        start_byte = target_idx * 8
+        offset_bytes = self._mmap[start_byte : start_byte + 8]
+
+        # 边界检查：防止 mmap 损坏或截断
+        if len(offset_bytes) < 8:
+            debug_log("索引文件损坏或读取越界")
+            return
+
+        offset = struct.unpack("<Q", offset_bytes)[0]
+
+        self._fp.seek(offset)
+        self._file_idx = target_idx
+
+    def seek_to(self, index: int) -> None:
+        """跳转到全局索引位置 (包含 insert 的数量)，并持久化 checkpoint"""
+        if index < len(self.insert):
+            self._insert_idx = index
+            self._file_idx = 0
+            self._seek_file_to(0)
         else:
-            self._fp.seek(0, 2)
-        self._line_index = n
-        self._dirty = 0
-        self._save_checkpoint()
+            self._insert_idx = len(self.insert)
+            self._seek_file_to(index - len(self.insert))
+
+        self.save_checkpoint()
 
     def reset(self) -> None:
-        """重置到文件起点并清除 checkpoint。"""
-        self.seek_to_line(0)
-        self._use_empty_password_done = False
-        try:
-            self._checkpoint_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        """重置到起点并清除 checkpoint"""
+        self._insert_idx = 0
+        self._file_idx = 0
+        self._seek_file_to(0)
+
+        for f in (
+            self.checkpoint_file,
+            self.insert_checkpoint_file,
+            self.loader_hash_file,
+        ):
+            f.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
-    # 属性
+    # 属性提取
     # ------------------------------------------------------------------
 
     @property
-    def line_count(self) -> int:
-        """文件物理行数（含空行）。"""
-        return len(self._offsets)
+    def file_line_count(self) -> int:
+        """大文件的物理行数"""
+        if self._mmap is None:
+            return 0
+        return max(0, len(self._mmap) // 8 - 1)
 
     @property
-    def current_line(self) -> int:
-        """下一次 readline() 将读取的物理行号（0-based）。"""
-        return self._line_index
+    def total_count(self) -> int:
+        """预置名单 + 文件总行数"""
+        return len(self.insert) + self.file_line_count
+
+    @property
+    def current_index(self) -> int:
+        """当前全局进度索引"""
+        return self._insert_idx + self._file_idx
 
     @property
     def remaining_count(self) -> int:
-        """
-        剩余物理行数（含空行）加上未消耗的空密码计数。
-        注意：实际返回的非空词数可能更少。
-        """
-        remaining = max(0, self.line_count - self._line_index)
-        if self._use_empty_password and not self._use_empty_password_done:
-            remaining += 1
-        return remaining
+        return max(0, self.total_count - self.current_index)
 
     # ------------------------------------------------------------------
-    # 迭代器协议
+    # Context & Iterator
     # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """安全释放所有资源"""
+        if self._fp is not None and not self._fp.closed:
+            self.save_checkpoint()
+            self._fp.close()
+
+        if self._mmap is not None:
+            self._mmap.close()
+            self._mmap = None
+
+        if self._index_fp is not None and not self._index_fp.closed:
+            self._index_fp.close()
+
+    def __enter__(self) -> "WordlistLoader":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __iter__(self) -> Iterator[str]:
         while (word := self.next_word()) is not None:
@@ -397,282 +418,229 @@ class WordlistLoader:
             raise StopIteration
         return word
 
+    def __del__(self) -> None:
+        self.close()
+
     def __repr__(self) -> str:
         status = (
             "closed"
             if (self._fp is None or self._fp.closed)
-            else f"line {self._line_index}/{self.line_count}"
+            else f"pos={self.current_index}/{self.total_count}"
         )
         return (
             f"<WordlistLoader path={self.path.name!r} "
-            f"lines={self.line_count} {status}>"
+            f"total={self.total_count} {status}>"
         )
 
 
-# ---------------------------------------------------------------------------
-# PayloadLoader
-# ---------------------------------------------------------------------------
-
-
-class CombineStrategy(Enum):
-    PARALLEL = auto()   # zip：所有字段同步前进，最短词表耗尽即停
-    PRODUCT = auto()    # itertools.product：全排列
-
-
-class _ProductCheckpoint:
-    """
-    Fix #8: PRODUCT 模式下的组合状态 checkpoint。
-
-    存储各层 loader 当前的物理行号，恢复时直接 seek_to_line，
-    无需销毁内层 loader 的 checkpoint 文件。
-    """
-
-    __slots__ = ("path",)
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-
-    def save(self, line_indices: list[int]) -> None:
-        try:
-            self.path.write_text(json.dumps({"indices": line_indices}, separators=(",", ":")))
-        except Exception:
-            pass
-
-    def load(self) -> list[int] | None:
-        try:
-            data = json.loads(self.path.read_text())
-            indices = data.get("indices")
-            if isinstance(indices, list) and all(isinstance(i, int) for i in indices):
-                return indices
-        except Exception:
-            pass
-        return None
-
-    def delete(self) -> None:
-        try:
-            self.path.unlink(missing_ok=True)
-        except Exception:
-            pass
+# ==========================================
+# PayloadLoader 核心类
+# ==========================================
 
 
 class PayloadLoader:
-    """
-    WordlistLoader 的多字段组合包装器。
-
-    策略
-    ----
-    PARALLEL : zip 语义，所有字段同步推进，最短词表耗尽即停。
-               支持断点续传（各 loader 独立 checkpoint）。
-    PRODUCT  : 全排列，第 0 个字段最慢（外层），最后字段最快（内层）。
-               Fix #8: 使用独立的组合状态 checkpoint，内层 loader
-               reset 时不再销毁其 checkpoint 文件。
-
-    注意：非线程安全，多线程场景请在外部加锁。
-    Fix #11: next() 的惰性初始化在多线程下存在竞态，使用方需自行加锁。
-
-    用法示例
-    --------
-    # 并行模式
-    loader = PayloadLoader(
-        [("user", "users.txt"), ("pass", "passwords.txt")],
-        strategy=CombineStrategy.PARALLEL,
-    )
-
-    # 全排列模式（断点续传）
-    loader = PayloadLoader(
-        [("user", "users.txt"), ("pass", "passwords.txt")],
-        strategy=CombineStrategy.PRODUCT,
-        continue_=True,
-        tag="my_task",
-    )
-
-    with loader:
-        while (payload := loader.next()) is not None:
-            print(payload)  # {"user": "admin", "pass": "123456"}
-    """
 
     def __init__(
         self,
-        fields: list[tuple[str, str | Path]],
-        strategy: CombineStrategy = CombineStrategy.PRODUCT,
+        fields: list[tuple[str, str | Path, list[str]] | tuple[str, str | Path]],
+        parallel: bool = False,
         *,
         encoding: str = "utf-8",
         strip: bool = True,
+        tag: str | None = None,
         continue_: bool = False,
         cache_dir: Path | None = None,
         checkpoint_interval: int = 1000,
         rollback: int = 1,
-        tag: str | None = None,
     ) -> None:
         if not fields:
-            raise ValueError("fields 不能为空")
+            raise ValueError("fields 列表不能为空")
 
-        self._names: list[str] = [name for name, _ in fields]
-        self._strategy = strategy
-        self._continue = continue_
+        self.fields = fields
+        self.parallel = parallel
+        self.continue_ = continue_
+        self.checkpoint_interval = checkpoint_interval
+        self.rollback = max(0, rollback)
 
-        cache_dir = Path(cache_dir) if cache_dir else _DEFAULT_CACHE_DIR
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        if tag:
+            self.tag = tag
+        else:
+            tag_src = str([(name, str(Path(path).resolve())) for name, path, *_ in fields])
+            self.tag = hashlib.md5(tag_src.encode()).hexdigest()[:12]
 
-
+        self._names: list[str] = []
         self._loaders: list[WordlistLoader] = []
-        for i, (name, path) in enumerate(fields):
-            path_hash = hashlib.md5(str(Path(path).resolve()).encode()).hexdigest()[:8]
-            field_tag = f"{tag or 'pl'}_{i}_{name}_{path_hash}" if tag else None
-            self._loaders.append(
-                WordlistLoader(
-                    path,
+        self._values: list[str] = []
+
+
+        for i, field in enumerate(fields):
+            if len(field) == 3:
+                name, path, insert_list = field  # type: ignore[misc]
+            else:
+                name, path = field  # type: ignore[misc]
+                insert_list = None
+
+            self._names.append(name)
+            sub_tag = f"{self.tag}_{i}_{name}"
+
+            if parallel:
+                # 全排列
+                loader = WordlistLoader(
+                    path=path,
                     encoding=encoding,
                     strip=strip,
-                    tag=field_tag,
-                    continue_=continue_ and strategy == CombineStrategy.PARALLEL,
+                    tag=sub_tag,
+                    continue_=True,
                     cache_dir=cache_dir,
                     checkpoint_interval=checkpoint_interval,
+                    insert=insert_list,
+                    rollback=1 if i != len(fields) - 1 else rollback, # 非最内层取1用于恢复时便于.next_word()恢复self._values
+                )
+                if not self.continue_:
+                    loader.reset()
+            else:
+                loader = WordlistLoader(
+                    path=path,
+                    encoding=encoding,
+                    strip=strip,
+                    tag=sub_tag,
+                    continue_=continue_,
+                    cache_dir=cache_dir,
+                    checkpoint_interval=checkpoint_interval,
+                    insert=insert_list,
                     rollback=rollback,
                 )
+
+            self._loaders.append(loader)
+
+    # ------------------------------------------------------------------
+    # Parallel 模式（zip）
+    # ------------------------------------------------------------------
+
+    def _next_parallel(self) -> Optional[dict[str, str]]:
+        """
+        Parallel/zip 模式：所有字段同步推进，任一耗尽即停止。
+        """
+        result: dict[str, str] = {}
+        for name, loader in zip(self._names, self._loaders):
+            word = loader.next_word()
+            if word is None:
+                return None
+            result[name] = word
+        return result
+
+    # ------------------------------------------------------------------
+    # Product 模式（全排列）核心逻辑
+    # ------------------------------------------------------------------
+
+    def _next_product(self) -> Optional[dict[str, str]]:
+        if not self._values:
+            for loader in self._loaders:
+                word = loader.next_word()
+                if word is None:
+                    return None
+                self._values.append(word)
+            return dict(zip(self._names, self._values))
+
+        for i in range(len(self._loaders) - 1, -1, -1):
+            word = self._loaders[i].next_word()
+            if word is not None:
+                self._values[i] = word
+                return dict(zip(self._names, self._values)) # 当前维度取到值就返回
+
+            # 当前维度溢出，进位
+            self._loaders[i].reset()
+            word = self._loaders[i].next_word()
+            if word is None:
+                return None  # 空字典文件
+            self._values[i] = word
+            # 每层操作都会设置实际的self._values[i]，能够确保进位后非i层的缓存值都是有效的
+
+            if i == 0:
+                return None  # 最高位溢出，遍历完毕
+
+        return None  # 不可达，保持类型完整性
+
+    # ------------------------------------------------------------------
+    # 公开接口
+    # ------------------------------------------------------------------
+
+    def next(self) -> Optional[dict[str, str]]:
+        if self.parallel:
+            return self._next_parallel()
+        else:
+            return self._next_product()
+
+    def reset(self) -> None:
+        self._values = []
+        for loader in self._loaders:
+            loader.reset()
+
+    def save_checkpoint(self):
+        for loader in self._loaders:
+            loader.save_checkpoint()
+
+
+    @property
+    def names(self) -> list[str]:
+        """所有字段名称"""
+        return list(self._names)
+
+    @property
+    def remaining_count(self) -> int:
+        if self.parallel:
+            return min(
+                (loader.remaining_count for loader in self._loaders),
+                default=0,
             )
 
-        # PRODUCT 模式专用 checkpoint
-        product_tag = tag or hashlib.md5(
-            "".join(str(Path(p).resolve()) for _, p in fields).encode()
-        ).hexdigest()[:12]
-        self._product_cp = _ProductCheckpoint(
-            cache_dir / f"{product_tag}.product_cp.json"
+        counts = [loader.total_count for loader in self._loaders]
+        n = len(counts)
+
+        suffix = [1] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            suffix[i] = suffix[i + 1] * counts[i]
+
+        consumed = sum(
+            loader.current_index * suffix[i + 1]
+            for i, loader in enumerate(self._loaders)
         )
+        return max(0, suffix[0] - consumed)
 
-        # 惰性构建迭代器
-        self._iter: Iterator[tuple[str, ...]] | None = None
 
-        # PRODUCT + continue_: 恢复各层行号
-        if continue_ and strategy == CombineStrategy.PRODUCT:
-            self._restore_product_checkpoint()
+
+    @property
+    def total_count(self) -> int:
+        counts = [loader.total_count for loader in self._loaders]
+        if self.parallel:
+            return min(counts) if counts else 0
+        else:
+            result = 1
+            for c in counts:
+                result *= c
+            return result
 
     # ------------------------------------------------------------------
-    # 上下文管理
+    # Context Manager & Iterator Protocol
     # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """安全释放所有 loader 资源"""
+        for loader in self._loaders:
+            try:
+                loader.save_checkpoint()
+                loader.close()
+            except Exception as e:
+                debug_log(f"PayloadLoader close 异常: {e}")
 
     def __enter__(self) -> "PayloadLoader":
         return self
 
-    def __exit__(self, *_) -> None:
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def close(self) -> None:
-        for loader in self._loaders:
-            loader.close()
-
-    # ------------------------------------------------------------------
-    # PRODUCT checkpoint 恢复
-    # ------------------------------------------------------------------
-
-    def _restore_product_checkpoint(self) -> None:
-        indices = self._product_cp.load()
-        if indices is None or len(indices) != len(self._loaders):
-            return
-        for loader, idx in zip(self._loaders, indices):
-            if 0 <= idx <= loader.line_count:
-                try:
-                    loader.seek_to_line(idx)
-                except Exception:
-                    pass
-
-    def _save_product_checkpoint(self) -> None:
-        indices = [loader.current_line for loader in self._loaders]
-        self._product_cp.save(indices)
-
-    # ------------------------------------------------------------------
-    # 迭代器构建（惰性，首次调用 next() 时初始化）
-    # ------------------------------------------------------------------
-
-    def _build_iter(self) -> Iterator[tuple[str, ...]]:
-        match self._strategy:
-            case CombineStrategy.PARALLEL:
-                return self._parallel_iter()
-            case CombineStrategy.PRODUCT:
-                return self._product_iter()
-            case _:
-                raise ValueError(f"未知策略: {self._strategy}")
-
-    def _parallel_iter(self) -> Iterator[tuple[str, ...]]:
-        """所有 loader 同步推进，任一耗尽即停（zip 语义）。"""
-        while True:
-            words: list[str] = []
-            for loader in self._loaders:
-                word = loader.next_word()
-                if word is None:
-                    return
-                words.append(word)
-            yield tuple(words)
-
-    def _product_iter(self) -> Iterator[tuple[str, ...]]:
-        """
-        全排列迭代器
-        遍历顺序：第 0 个字段最慢（最外层循环），最后一个字段最快。
-        """
-        n = len(self._loaders)
-        if n == 0:
-            return
-
-        # 各层当前词缓存，None 表示该层需要推进
-        slots: list[str | None] = [None] * n
-        # 先为除最内层外的每层取第一个词
-        for i in range(n - 1):
-            word = self._loaders[i].next_word()
-            if word is None:
-                return  # 某层词表为空，无法构成任何组合
-            slots[i] = word
-
-        # 最内层始终在最快的内循环推进
-        while True:
-            word = self._loaders[-1].next_word()
-            if word is not None:
-                slots[-1] = word
-                self._save_product_checkpoint()
-                yield tuple(slots)  # type: ignore[arg-type]
-                continue
-
-            # 最内层耗尽，向外进位
-            carry = n - 1
-            while carry >= 0:
-                # 重置当前层（不删除其 checkpoint）
-                self._loaders[carry].seek_to_line(0)
-                carry -= 1
-                if carry < 0:
-                    return  # 所有层都耗尽
-                next_word = self._loaders[carry].next_word()
-                if next_word is not None:
-                    slots[carry] = next_word
-                    break
-                # carry 层也耗尽，继续向外进位
-
-            # carry 层成功推进，重置 carry+1 到 n-2 层（已在循环中重置过 n-1 层）
-            for i in range(carry + 1, n - 1):
-                self._loaders[i].seek_to_line(0)
-                word_i = self._loaders[i].next_word()
-                if word_i is None:
-                    return  # 该层词表为空（理论上不应发生，防御性检查）
-                slots[i] = word_i
-
-    # ------------------------------------------------------------------
-    # 核心接口
-    # ------------------------------------------------------------------
-
-    def next(self) -> Optional[dict[str, str]]:
-        """返回下一个组合 payload，耗尽返回 None。"""
-        if self._iter is None:
-            self._iter = self._build_iter()
-        try:
-            assert self._iter is not None
-            values = next(self._iter)
-            return dict(zip(self._names, values))
-        except StopIteration:
-            return None
-
-    # ------------------------------------------------------------------
-    # 迭代器协议
-    # ------------------------------------------------------------------
-
     def __iter__(self) -> Iterator[dict[str, str]]:
+        """支持 for payload in loader: ... 用法"""
         while (payload := self.next()) is not None:
             yield payload
 
@@ -682,17 +650,20 @@ class PayloadLoader:
             raise StopIteration
         return payload
 
-    # ------------------------------------------------------------------
-    # 状态查询
-    # ------------------------------------------------------------------
-
-    @property
-    def strategy(self) -> CombineStrategy:
-        return self._strategy
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __repr__(self) -> str:
+        mode = "parallel" if self.parallel else "product"
         fields = ", ".join(
             f"{name}={loader!r}"
             for name, loader in zip(self._names, self._loaders)
         )
-        return f"<PayloadLoader strategy={self._strategy.name} fields=[{fields}]>"
+        return (
+            f"<PayloadLoader mode={mode!r} "
+            f"total≈{self.total_count} remaining≈{self.remaining_count} "
+            f"fields=[{fields}]>"
+        )

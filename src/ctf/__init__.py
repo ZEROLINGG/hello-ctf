@@ -21,6 +21,9 @@ from ctf.burp.burp import Step,StepAction,BurpAsync,BurpAsyncPool
 
 
 
+from importlib.metadata import version
 
+__version__ = version("hello-ctf")
 def main() -> None:
-    print("Hello from hello-ctf!")
+    print(f"hello-ctf {__version__}")
+
